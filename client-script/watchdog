@@ -1,0 +1,481 @@
+#!/bin/bash
+
+function wait_other()
+{
+    if [ -f "${local_dir}${wait_file}" ]; then
+        echo_with_log "wait other acs task"
+    fi  
+    while [ -f "${local_dir}${wait_file}" ]
+    do
+        sleep 10
+    done
+    touch "${local_dir}${wait_file}"
+}
+
+function echo_to_log()
+{
+    local time=$(date +%Y-%m-%d)
+    local name="log_${time}.log"
+    local log_name="${local_logs_dir}${name}"
+    if [ ! -f "${log_name}" ]; then
+        touch "${log_name}"
+        chmod o-r "${log_name}"
+    fi  
+    echo "${*:1}" >> "${log_name}"
+}
+
+function echo_with_log()
+{
+    if [ "$*" != "" ]; then
+        for draft_str in "$@"; do
+            echo "${draft_str}"
+            echo_to_log "${draft_str}"
+        done
+    else
+        echo ""
+        echo_to_log ""
+    fi
+}
+
+function read_config()
+{
+    local script_path=`readlink -e $0`
+    local script_dir=`dirname "${script_path}"`
+    local config_file="${script_dir}/config"
+    if [ -f "${config_file}" ]; then
+        device_name=`cat "${config_file}" | grep device_name$(printf '\t') | awk '{print $2}'`
+        srv_ip=`cat "${config_file}" | grep srv_ip$(printf '\t') | awk '{print $2}'`
+        srv_port=`cat "${config_file}" | grep srv_port$(printf '\t') | awk '{print $2}'`
+        srv_key=`cat "${config_file}" | grep srv_key$(printf '\t') | awk '{print $2}'`
+        srv_login=`cat "${config_file}" | grep srv_login$(printf '\t') | awk '{print $2}'`
+        local_login=`cat "${config_file}" | grep local_login$(printf '\t') | awk '{print $2}'`
+        srv_dir=`cat "${config_file}" | grep srv_dir$(printf '\t') | awk '{print $2}'`
+        local_dir=`cat "${config_file}" | grep local_dir$(printf '\t') | awk '{print $2}'`
+        srv_logs_dir=`cat "${config_file}" | grep srv_logs_dir$(printf '\t') | awk '{print $2}'`
+        local_logs_dir=`cat "${config_file}" | grep local_logs_dir$(printf '\t') | awk '{print $2}'`
+        srv_clients_ip_dir=`cat "${config_file}" | grep srv_clients_ip_dir$(printf '\t') | awk '{print $2}'`
+        srv_command=`cat "${config_file}" | grep srv_command$(printf '\t') | awk '{print $2}'`
+        srv_web_addr=`cat "${config_file}" | grep srv_web_addr$(printf '\t') | awk '{print $2}'`
+        acs_config=`cat "${config_file}" | grep acs_config$(printf '\t') | awk '{print $2}'`
+        wait_file=`cat "${config_file}" | grep wait_file$(printf '\t') | awk '{print $2}'`
+        force_file=`cat "${config_file}" | grep force_file$(printf '\t') | awk '{print $2}'`
+        python_script=`cat "${config_file}" | grep python_script$(printf '\t') | awk '{print $2}'`
+        python_state=`cat "${config_file}" | grep python_state$(printf '\t') | awk '{print $2}'`
+        python_token=`cat "${config_file}" | grep python_token$(printf '\t') | awk '{print $2}'`
+    else
+        echo "ERROR. No config file!"
+        echo ""
+        exit 53
+    fi
+}
+
+function acs_state()
+{
+    if [ $(screen -ls | grep "acs_python" | wc -l) = "1" ]; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+function acs_start()
+{
+    acs_stop
+    if [ "${python_state}" = "enable" ]; then
+        screen -S "acs_python" -d -m -- "${local_dir}${python_script}"
+        echo_with_log "acs started"
+    else
+        echo_with_log "acs is manually stopped"
+    fi
+}
+
+function acs_stop()
+{
+    if [ $(acs_state) == "1" ]; then
+        screen -S "acs_python" -p 0 -X quit
+        echo_with_log "acs stopped"
+    else
+        echo_with_log "acs is already stopped"
+    fi
+}
+
+function acs_set()
+{
+    if [[ "${python_state}" != "$1" ]]; then
+        old_acs_str=`cat "${local_dir}$acs_config"|grep $python_state$(printf '\t')`
+        acs_str=`cat "${local_dir}$acs_config"|grep $python_state$(printf '\t')|sed "s/${python_state}/$1/"`
+        sed -i "s~$old_acs_str~$acs_str~" "${local_dir}$acs_config"
+        python_state="$1"
+        echo_with_log  "acs set $1"
+    else
+        echo_with_log "acs already set $1"
+    fi
+}
+
+function acs_sync()
+{
+    echo_with_log "start sync logs"
+    rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${local_logs_dir}"*.log "${srv_login}@${srv_ip}:${srv_logs_dir}${device_name}/"
+    echo_with_log "end sync logs"
+}
+
+function acs_update()
+{
+    touch "${local_dir}${force_file}"
+    acs_stop
+    sleep 10
+    need_force_update="0"
+    if [ ! -f "${local_dir}${python_script}" ]; then
+        if [ -f "${local_dir}${python_script}.old" ]; then
+            echo_with_log "no current version, return old"
+            mv -f "${local_dir}${python_script}.old" "${local_dir}${python_script}"
+            rm "${local_dir}${force_file}"
+            rm -f "${local_dir}${wait_file}"
+            echo_with_log ""
+            exit
+        fi
+        need_force_update="1"
+    fi
+    rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}" "${local_dir}${python_script}.tmp"
+    if [ ! -f "${local_dir}${python_script}.tmp" ]; then
+        sleep 10
+        rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}" "${local_dir}${python_script}.tmp"
+    fi
+    if [ ! -f "${local_dir}${python_script}.tmp" ]; then
+        echo_with_log "no script file on srv, exit"
+        rm "${local_dir}${force_file}"
+        rm -f "${local_dir}${wait_file}"
+        echo_with_log ""
+        exit
+    fi
+    if [ "${need_force_update}" == "1" ]; then
+        mv -f "${local_dir}${python_script}" "${local_dir}${python_script}.old"
+        mv -f "${local_dir}${python_script}.tmp" "${local_dir}${python_script}"
+        echo_with_log "update is completed"
+        rm "${local_dir}${update_file}"
+    fi
+    rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}.md5" "${local_dir}${python_script}.md5"
+    if [ ! -f "${local_dir}${python_script}.md5" ]; then
+        sleep 10
+        rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}.md5" "${local_dir}${python_script}.md5"
+    fi
+    md5sum_check=$(md5sum "${local_dir}${python_script}.tmp" | awk '{print $1}')
+
+    if [ "${md5sum_check}" != "$(cat ${local_dir}${python_script}.md5 | awk '{print $1}')" ]; then
+        echo_with_log "bad check sum, repeat"
+        rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}" "${local_dir}${python_script}.tmp"
+        if [ ! -f "${local_dir}${python_script}.tmp" ]; then
+            sleep 10
+            rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}" "${local_dir}${python_script}.tmp"
+        fi
+        rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}.md5" "${local_dir}${python_script}.md5"
+        if [ ! -f "${local_dir}${python_script}.md5" ]; then
+            sleep 10
+            rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${python_script}.md5" "${local_dir}${python_script}.md5"
+        fi
+        md5sum_check=$(md5sum "${local_dir}${python_script}.tmp" | awk '{print $1}')
+    fi
+    if [ "${md5sum_check}" != "$(cat ${local_dir}${python_script}.md5 | awk '{print $1}')" ]; then
+        echo_with_log "bad check sum, exit"
+        rm "${local_dir}${force_file}"
+        rm -f "${local_dir}${wait_file}"
+        echo_with_log ""
+        exit
+    fi
+    echo_with_log "good check sum"
+    current_version=$(cat ${local_dir}${python_script} | grep __version__ | awk '{print $3}')
+    new_version=$(cat ${local_dir}${python_script}.tmp | grep __version__ | awk '{print $3}')
+    if [ "${current_version}" == "${new_version}" ]; then
+        echo_with_log "local version is optimal, exit"
+    else
+        echo_with_log "current version: ${current_version}"
+        echo_with_log "new version: ${new_version}"
+        mv -f "${local_dir}${python_script}" "${local_dir}${python_script}.old"
+        mv -f "${local_dir}${python_script}.tmp" "${local_dir}${python_script}"
+        echo_with_log "update is completed"
+    fi
+    rm "${local_dir}${force_file}"
+    acs_start
+}
+
+function acs_enable()
+{
+    acs_set "enable"
+    acs_start
+}
+
+function acs_disable()
+{
+    acs_set "disable"
+    acs_stop
+}
+
+function acs_status()
+{
+    if [ $(acs_state) == "1" ]; then
+        echo_with_log "acs: working"
+    else
+        echo_with_log "acs: idle"
+    fi
+}
+
+function acs_check_python()
+{
+    if [ $(acs_state) == "1" ]; then
+        if [ "${python_state}" = "enable" ]; then
+            echo "acs is working"
+        else
+            echo_with_log "acs is working once"
+        fi
+    else
+        if [ "${python_state}" = "enable" ]; then
+            echo_with_log "ERROR"
+            echo_with_log "acs forcedly stopped"
+            echo "$(date +%d-%m-%Y) $(date +%H:%M): acs forcedly stopped" >> /tmp/acs_mail_tmp
+            echo_with_log "acs restarted"
+            acs_start
+        else
+            echo "acs is manually stopped"
+        fi
+    fi
+}
+
+function acs_check_command()
+{
+    rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "${srv_login}@${srv_ip}:${srv_dir}${srv_command}" "${local_dir}${srv_command}"
+    if [ -f "${local_dir}${srv_command}" ]; then
+        script_params=$(cat ${local_dir}${srv_command})
+        if [ "${script_params}" = "null" ]; then
+            echo_with_log "nothing to do from server"
+        elif [ "${script_params}" = "command" ]; then
+            echo_with_log "error with recursive params: ${script_params}"
+        else
+            echo_with_log "starting params: ${script_params}"
+            start_script "${script_params}"
+        fi
+    else
+        echo_with_log "no server command"
+    fi
+}
+
+function acs_delete()
+{
+    if [ $(/usr/bin/find "${local_logs_dir}"*.log -mtime +31 -exec echo "del: {}" \; | wc -l) != 0 ]; then
+        echo_with_log "$(/usr/bin/find "${local_logs_dir}"*.log -mtime +31 -exec echo "del: {}" \;)"
+        /usr/bin/find "${local_logs_dir}"*.log -mtime +31 -exec rm {} \;
+    else
+        echo_with_log "No logs to delete"
+    fi
+}
+
+function acs_ip()
+{
+    local myip=$(ip addr show eth0 | grep "inet\b" | awk '{print $2}' | cut -d "/" -f1)
+    echo "${myip}" > /tmp/acs_my_ip_tmp
+    local ip_need_update="0"
+    if [ ! -f "/tmp/acs_my_ip" ]; then
+        ip_need_update="1"
+    else
+        local oldip=$(cat "/tmp/acs_my_ip")
+        if [ "${myip}" != "${oldip}" ]; then
+            ip_need_update="1"
+        fi
+    fi
+    if [ "${ip_need_update}" = "1" ]; then
+        mv "/tmp/acs_my_ip_tmp" "/tmp/acs_my_ip"
+    fi
+    rsync -av --progress -e "ssh -p ${srv_port} -i ${srv_key}" "/tmp/acs_my_ip" "${srv_login}@${srv_ip}:${srv_clients_ip_dir}${device_name}"
+    rm -f "/tmp/acs_my_ip_tmp"
+}
+
+function acs_help()
+{
+    echo "Available commands:"
+    echo "sync                  - synchronize log file with main server"
+    echo "update                - synchronize rfid and web script from main server"
+    echo "enable                - set enable rfid and web script"
+    echo "disable               - set disable rfid and web script"
+    echo "status                - show state rfid and web script"
+    echo "check                 - check and resume rfid and web script"
+    echo "log     [LOG_FILE]    - show today or choosen log"
+    echo "error   [LOG_FILE]    - show errors in today or choosen log"
+    echo "delete                - delete logs more than 31 days ago"
+    echo "ip                    - say ip to server"
+    echo "init                  - update, command, check, sync, ip"
+    echo "help                  - print this message"
+}
+
+function start_script()
+{
+    case "$1" in
+        sync)
+            acs_sync
+            echo_with_log ""
+            ;;
+        update)
+            acs_update
+            acs_sync
+            echo_with_log ""
+            ;;
+        enable)
+            acs_enable
+            echo_with_log ""
+            ;;
+        disable)
+            acs_disable
+            echo_with_log ""
+            ;;
+        status)
+            acs_status
+            echo_with_log ""
+            ;;
+        check)
+            acs_check_python
+            acs_check_command
+            echo_with_log ""
+            ;;
+        delete)
+            acs_delete
+            echo_with_log ""
+            ;;
+        log|error)
+            log_file=""
+            if [ "$#" = "1" ]; then
+                local log_time=$(date +%Y-%m-%d)
+                local log_name="log_${log_time}.log"
+                if [ ! -f "${local_logs_dir}${log_name}" ]; then
+                    echo "No today logs"
+                    echo_with_log ""
+                    rm "${local_dir}${wait_file}"
+                    exit 53
+                fi
+                log_file="${local_logs_dir}${log_name}"
+            else
+                log_file="$2"
+            fi
+            echo_with_log ""
+            rm "${local_dir}${wait_file}"
+            if [ "$1" = "error" ]; then
+                cat "${log_file}" | grep ERROR -A5 -B20
+            else
+                less +G "${log_file}"
+            fi
+            touch "${local_dir}${wait_file}"
+            ;;
+        ip)
+            acs_ip
+            echo_with_log ""
+            ;;
+        ERROR)
+            acs_error
+            echo_with_log ""
+            ;;
+        init)
+            acs_update
+            acs_check_command
+            acs_check_python
+            acs_sync
+            acs_ip
+            echo_with_log ""
+            ;;
+        help|*)
+            acs_help
+            echo_with_log ""
+            ;;
+    esac
+    rm -f "${local_dir}${wait_file}"
+}
+
+read_config
+
+if [ ! "x${local_login}" = "x$(whoami)" ]; then
+    if [ -f "/tmp/acs_tmp_log" ]; then
+        rm -f "/tmp/acs_tmp_log"
+    fi
+    echo "login: $(whoami)" >> "/tmp/acs_tmp_log"
+    echo "date: $(date)" >> "/tmp/acs_tmp_log"
+    echo "command: $0 $*" >> "/tmp/acs_tmp_log"
+    case "$1" in
+        sync|update|disable|delete|ip)
+            if [ $(cat /etc/group | grep "${local_login}:" | grep $(whoami) | wc -l) == 0 ]; then
+                echo "You have no access to this command: $1"
+                echo "You have no access to this command: $1" >> "/tmp/acs_tmp_log"
+                script_params="ERROR"
+            else
+                script_params=""
+            fi
+            ;;
+        *)
+            script_params=""
+            ;;
+    esac
+    if [ "${script_params}" = "" ]; then
+        sudo -u "${local_login}" $0 $1
+    else
+        sudo -u "${local_login}" $0 $1 "${script_params}"
+    fi
+    exit
+else
+    if [ -f "/tmp/acs_tmp_log" ]; then
+        draft_time=$(date +%Y-%m-%d)
+        draft_name="log_${draft_time}.log"
+        draft_log_name="${local_logs_dir}${draft_name}"
+        if [ ! -f "${draft_log_name}" ]; then
+            touch "${draft_log_name}"
+            chmod o-r "${draft_log_name}"
+        fi
+        cat "/tmp/acs_tmp_log" >> "${draft_log_name}"
+        sudo /bin/chown "${local_login}:${local_login}-all" "/tmp/acs_tmp_log"
+        rm -f "/tmp/acs_tmp_log"
+    else
+        echo_to_log "login: $(whoami)"
+        echo_to_log "date: $(date)"
+        echo_to_log "command: $0 $*"
+    fi
+fi
+
+wait_other
+
+case "$1" in
+    auto)
+        if [ -f "${local_dir}${force_file}" ]; then
+            echo_with_log "force auto stop detected, exit"
+            echo_with_log ""
+            exit 53
+        fi
+        now_min=$(date +%M)
+        now_hour=$(date +%H)
+        # now_min="$3"
+        # now_hour="$2"
+        case "${now_min}" in
+            00)
+                case "${now_hour}" in
+                    00)
+                        script_params="sync"
+                        ;;
+                    05)
+                        script_params="update"
+                        ;;
+                    23)
+                        script_params="delete"
+                        ;;
+                    *)
+                        script_params="check"
+                        ;;
+                esac
+                ;;
+            *)
+                script_params="check"
+                ;;
+        esac
+        ;;
+    sync|update|enable|disable|status|check|delete|log|error|ip|init|help|*)
+        script_params="$1"
+        ;;
+esac
+
+if [ "$2" = "ERROR" ]; then
+    script_params="ERROR"
+fi
+
+start_script "${script_params}"
